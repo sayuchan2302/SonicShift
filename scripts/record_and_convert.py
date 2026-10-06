@@ -1,8 +1,8 @@
-"""
+﻿"""
 scripts/record_and_convert.py - Record & Audition Voice Changer Tool
 
-Records your voice from the microphone for a specified duration (e.g. 5 seconds),
-converts it from Male to Female using neural RVC v2 on your NVIDIA RTX 3050 GPU,
+Records your voice from the microphone for a specified duration (e.g. 5-8 seconds),
+converts it from Male to Female using neural RVC v2 on NVIDIA RTX 3050 GPU,
 saves both the original and converted audio files to recordings/, and automatically
 opens the converted file so you can audition the result immediately!
 """
@@ -67,7 +67,7 @@ def record_voice(
     print("=" * 70)
 
     # Countdown
-    print("\nChuan bi noi (hay noi to, ro rang gan micro):")
+    print("\nChuan bi noi (hay noi to, ro rang, de micro gan mieng):")
     for count in [3, 2, 1]:
         print(f"  --> {count}...")
         time.sleep(1.0)
@@ -121,9 +121,47 @@ def record_voice(
 
     print(f"-> Thong so am goc: Peak = {peak:.4f} | RMS = {db_total:.1f} dB")
     if peak < 0.08:
-        print(" [LƯU Ý]: Giọng nói từ micro khá nhỏ. Bộ xử lý Auto-Gain đã tự động khuếch đại tín hiệu để AI nhận dạng ngữ âm chính xác.")
+        print(" [LƯU Ý]: Giọng nói từ micro khá nhỏ. Bộ xử lý Auto-Gain sẽ tự động khuếch đại tín hiệu để AI nhận dạng ngữ âm chính xác nhất.")
 
     return audio_data
+
+
+def resolve_model_path(model_arg: Optional[str]) -> str:
+    """Resolves model argument to a valid file path, supporting shortcuts."""
+    checkpoints_dir = _project_root / "models" / "checkpoints"
+
+    shortcut_map = {
+        "natural": checkpoints_dir / "natural_girl.pth",
+        "natural_girl": checkpoints_dir / "natural_girl.pth",
+        "natural_latina": checkpoints_dir / "natural_latina.pth",
+        "natural_soft": checkpoints_dir / "natural_soft.pth",
+        "nahida": checkpoints_dir / "nahida.pth",
+        "raiden": checkpoints_dir / "raiden_female.pth",
+        "howatto": checkpoints_dir / "howatto_female.pth",
+    }
+
+    if model_arg:
+        key = model_arg.strip().lower()
+        if key in shortcut_map and shortcut_map[key].is_file():
+            return str(shortcut_map[key])
+        p = Path(model_arg)
+        if p.is_file():
+            return str(p)
+        cand = checkpoints_dir / model_arg
+        if cand.is_file():
+            return str(cand)
+        cand_pth = checkpoints_dir / f"{model_arg}.pth"
+        if cand_pth.is_file():
+            return str(cand_pth)
+        print(f"[WARN] Khong tim thay model '{model_arg}'. Se dung model mac dinh.")
+
+    # Default order: nahida.pth -> raiden_female.pth -> howatto_female.pth
+    for pref in ["natural_girl.pth", "natural_latina.pth", "natural_soft.pth", "nahida.pth", "raiden_female.pth"]:
+        path = checkpoints_dir / pref
+        if path.is_file():
+            return str(path)
+
+    raise FileNotFoundError("Khong tim thay bat ky file model RVC (.pth) nao trong models/checkpoints/!")
 
 
 def main() -> None:
@@ -132,7 +170,10 @@ def main() -> None:
     parser.add_argument("--pitch", "-p", type=int, default=PITCH_SHIFT_SEMITONES, help="Do dich cao do (+12 cho Nam sang Nu)")
     parser.add_argument("--input", "-i", type=int, default=None, help="Device index cua micro (tuy chon)")
     parser.add_argument("--device", type=str, default=DEVICE, help="Thiet bi tinh toan ('cuda' hoac 'cpu')")
-    parser.add_argument("--model", "-m", type=str, default=None, help="Duong dan file model RVC .pth (mac dinh: howatto_female.pth)")
+    parser.add_argument(
+        "--model", "-m", type=str, default="natural",
+        help="Model RVC giong nu ('nahida', 'raiden', 'howatto' hoac duong dan .pth)"
+    )
     parser.add_argument("--play", action="store_true", default=True, help="Tu dong mo file nghe lai sau khi xu ly xong")
 
     args = parser.parse_args()
@@ -143,6 +184,14 @@ def main() -> None:
         print("[ERROR] Can cai thu vien soundfile: 'pip install soundfile'")
         sys.exit(1)
 
+    model_path = resolve_model_path(args.model)
+    model_name = Path(model_path).stem
+    print("\n" + "=" * 70)
+    print(f" MODEL GIONG NU : {model_name} ({Path(model_path).name})")
+    print(f" DICH CAO DO    : +{args.pitch} semitones (Nam -> Nu)")
+    print(f" GPU TANG TOC   : {args.device.upper()}")
+    print("=" * 70)
+
     # 1. Thu am giong goc
     raw_audio = record_voice(
         duration_sec=args.duration,
@@ -151,19 +200,10 @@ def main() -> None:
     )
 
     # 2. Xu ly chuyen giong tren GPU bang Neural RVC
-    print("\n[AI GPU] Dang chuyen doi giong tu Nam sang Nu bang Neural RVC v2 truyen HuBERT...")
+    print(f"\n[AI GPU] Dang chuyen doi giong sang [{model_name}] bang Neural RVC v2...")
     t0 = time.perf_counter()
     converter = VoiceConverter(sample_rate=SAMPLE_RATE, device=args.device)
-
-    # Tu dong nap model howatto_female.pth neu co san
-    model_to_use = args.model
-    if model_to_use is None:
-        default_ckpt = _project_root / "models" / "checkpoints" / "howatto_female.pth"
-        if default_ckpt.is_file():
-            model_to_use = str(default_ckpt)
-
-    if model_to_use:
-        converter.load_model(model_path=model_to_use, device=args.device)
+    converter.load_model(model_path=model_path, device=args.device)
 
     converted_audio = converter.infer(raw_audio, f0_up_key=args.pitch)
     elapsed_ms = (time.perf_counter() - t0) * 1000.0
@@ -175,7 +215,7 @@ def main() -> None:
 
     timestamp = time.strftime("%Y%m%d_%H%M%S")
     raw_path = out_dir / f"giong_goc_{timestamp}.wav"
-    converted_path = out_dir / f"giong_nu_{timestamp}.wav"
+    converted_path = out_dir / f"giong_nu_{model_name}_{timestamp}.wav"
 
     sf.write(str(raw_path), raw_audio, SAMPLE_RATE)
     sf.write(str(converted_path), converted_audio, SAMPLE_RATE)
@@ -189,7 +229,7 @@ def main() -> None:
 
     # 4. Tu dong mo file de nguoi dung nghe lai
     if args.play and os.name == "nt":
-        print("\n--> Dang mo file giong nu de ban nghe thu...")
+        print(f"\n--> Dang mo file giong nu ({model_name}) de ban nghe thu...")
         try:
             os.startfile(str(converted_path))
         except Exception as play_err:

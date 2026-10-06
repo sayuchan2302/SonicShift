@@ -145,9 +145,11 @@ def main() -> None:
     # Auto-load default female checkpoint if --model not specified
     model_to_use = args.model
     if model_to_use is None:
-        default_ckpt = _project_root / "models" / "checkpoints" / "howatto_female.pth"
-        if default_ckpt.is_file():
-            model_to_use = str(default_ckpt)
+        for pref in ["natural_girl.pth", "natural_latina.pth", "natural_soft.pth", "nahida.pth", "raiden_female.pth"]:
+            ckpt = _project_root / "models" / "checkpoints" / pref
+            if ckpt.is_file():
+                model_to_use = str(ckpt)
+                break
 
     converter.load_model(model_path=model_to_use, index_path=args.index, device=args.device)
     print(f"[AI ENGINE] Engine active on backend: [{converter.device.upper()}]")

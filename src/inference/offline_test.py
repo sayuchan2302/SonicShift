@@ -1,11 +1,12 @@
-"""
+﻿"""
 Offline RVC Inference Harness & GPU Benchmark (src/inference/offline_test.py)
 
 Provides a modular VoiceConverter architecture integrating:
   - Official RVC HuBERT speech representation encoder (12th layer, 100 fps)
   - VITS neural acoustic generator (SynthesizerTrnMs768NSFsid / SynthesizerTrnMs768NSFsid_nono)
+  - GPU-accelerated Crepe pitch estimation for F0-conditioned models
   - Automatic Gain Control (AGC) and noise gate for low-gain microphones
-  - Zero destructive waveform interpolation (high-fidelity resampling)
+  - Smooth linear phonetic feature interpolation (scale_factor=2)
 """
 
 from __future__ import annotations
@@ -31,6 +32,7 @@ from src.inference.hubert_loader import load_rvc_hubert
 class VoiceConverter:
     """
     High-fidelity Neural Voice Conversion Engine using RVC v2 architecture.
+    Automatically detects and handles both F0-guided models (f0=1) and pitchless models (f0=0).
     """
 
     def __init__(
@@ -74,6 +76,7 @@ class VoiceConverter:
         self._is_neural_model: bool = False
         self._net_g = None
         self._hubert = None
+        self._has_f0: bool = True
         self._model_sr: int = 40000
         self._resampler_to_16k = None
         self._resampler_to_target = None
@@ -96,15 +99,25 @@ class VoiceConverter:
         if model_path and Path(model_path).is_file() and self._torch_available:
             try:
                 import torchaudio
-                from .rvc.models import SynthesizerTrnMs768NSFsid_nono
+                from .rvc.models import (
+                    SynthesizerTrnMs768NSFsid,
+                    SynthesizerTrnMs768NSFsid_nono,
+                )
 
                 print(f"[AI NEURAL] Loading RVC v2 Model: {model_path} on [{self.device.upper()}]...")
                 cpt = self._torch.load(model_path, map_location="cpu", weights_only=False)
                 config = cpt.get("config", [])
                 self._model_sr = config[-1] if isinstance(config, list) and len(config) > 0 else 40000
+                self._has_f0 = cpt.get("f0", 1) == 1
 
-                # Instantiate VITS generator
-                net = SynthesizerTrnMs768NSFsid_nono(*config, is_half=False).to(self.device).eval()
+                # Instantiate VITS generator according to f0 capability
+                if self._has_f0:
+                    net = SynthesizerTrnMs768NSFsid(*config, is_half=False).to(self.device).eval()
+                    print(f"[AI NEURAL] Model architecture: NSF with Neural Pitch Conditioning (f0=1)")
+                else:
+                    net = SynthesizerTrnMs768NSFsid_nono(*config, is_half=False).to(self.device).eval()
+                    print(f"[AI NEURAL] Model architecture: Direct Non-F0 synthesis (f0=0)")
+
                 net.load_state_dict(cpt.get("weight", {}), strict=False)
                 self._net_g = net
 
@@ -115,7 +128,7 @@ class VoiceConverter:
                     device=self.device,
                 )
 
-                # Resamplers (accurate linear phase bandlimited)
+                # Resamplers (linear phase bandlimited)
                 if self.sample_rate != 16000:
                     self._resampler_to_16k = torchaudio.transforms.Resample(self.sample_rate, 16000).to(self.device)
                 if self._model_sr != self.sample_rate:
@@ -123,7 +136,7 @@ class VoiceConverter:
 
                 self._is_neural_model = True
                 self.model_loaded = True
-                print(f"[AI NEURAL] RVC v2 Neural Pipeline active! Native SR: {self._model_sr} Hz")
+                print(f"[AI NEURAL] RVC v2 Pipeline active! Native SR: {self._model_sr} Hz | F0 Guided: {self._has_f0}")
                 return
             except Exception as exc:
                 print(f"[WARN] Failed to load neural RVC model ({exc}). Falling back to Phase Vocoder.")
@@ -138,7 +151,7 @@ class VoiceConverter:
         f0_up_key: int = PITCH_SHIFT_SEMITONES,
     ) -> npt.NDArray[np.float32]:
         """
-        Processes an audio chunk and performs high-fidelity voice transformation.
+        Processes an audio chunk and performs high-fidelity neural voice transformation.
         """
         orig_shape = audio_chunk.shape
         flat_chunk = audio_chunk.ravel().astype(np.float32)
@@ -152,19 +165,20 @@ class VoiceConverter:
         if peak_amp < 0.003:
             return np.zeros(orig_shape, dtype=np.float32)
 
-        # Automatic Gain Control (AGC): normalize quiet speech so HuBERT extracts strong formants
-        gain_scale = 1.0
-        if peak_amp < 0.35:
-            gain_scale = 0.70 / max(1e-4, peak_amp)
+        # Automatic Gain Control (AGC): normalize quiet speech so HuBERT & Crepe get clear signal
+        if peak_amp < 0.30:
+            gain_scale = 0.65 / max(1e-4, peak_amp)
             flat_chunk = flat_chunk * gain_scale
 
         # 1. Authentic RVC v2 Neural Conversion Path
         if self._is_neural_model and self._net_g is not None and self._hubert is not None:
             try:
                 import torch
+                import torch.nn.functional as F
+
                 t_raw = torch.from_numpy(flat_chunk).float().unsqueeze(0).to(self.device)
 
-                # Resample to 16kHz for HuBERT
+                # Resample to 16kHz for HuBERT and pitch estimation
                 if self._resampler_to_16k is not None:
                     audio_16k = self._resampler_to_16k(t_raw)
                 else:
@@ -176,13 +190,56 @@ class VoiceConverter:
                     # Layer 11 (the 12th layer) is the standard semantic layer for RVC v2
                     phone = features_list[11] if len(features_list) > 11 else features_list[-1]
 
-                    # Standard RVC 100 fps frame duplication (HuBERT 50fps -> VITS 100fps)
-                    phone_100hz = phone.repeat_interleave(2, dim=1)
-
-                    # Synthesize with VITS generator
-                    phone_lengths = torch.tensor([phone_100hz.shape[1]], device=self.device)
+                    # Smooth linear interpolation (scale_factor=2: HuBERT 50fps -> VITS 100fps)
+                    phone_100hz = F.interpolate(phone.permute(0, 2, 1), scale_factor=2).permute(0, 2, 1)
+                    phone_len = phone_100hz.shape[1]
+                    phone_lengths = torch.tensor([phone_len], device=self.device)
                     sid = torch.tensor([0], device=self.device)
-                    synth = self._net_g.infer(phone_100hz, phone_lengths, sid)[0]
+
+                    if self._has_f0:
+                        import torchcrepe
+
+                        # High-accuracy pitch tracking on GPU
+                        f0 = torchcrepe.predict(
+                            audio_16k,
+                            sample_rate=16000,
+                            hop_length=160,
+                            fmin=50,
+                            fmax=1100,
+                            model="tiny",
+                            batch_size=512,
+                            device=self.device,
+                        )
+                        # Pitch shift: e.g. +12 semitones (Male to Female)
+                        if f0_up_key != 0:
+                            f0 = f0 * (2.0 ** (f0_up_key / 12.0))
+
+                        f0_np = f0.squeeze().cpu().numpy()
+                        if len(f0_np) < phone_len:
+                            f0_np = np.pad(f0_np, (0, phone_len - len(f0_np)))
+                        else:
+                            f0_np = f0_np[:phone_len]
+
+                        # Coarse quantization for embedding lookup
+                        f0_min = 50.0
+                        f0_max = 1100.0
+                        f0_mel_min = 1127.0 * np.log(1.0 + f0_min / 700.0)
+                        f0_mel_max = 1127.0 * np.log(1.0 + f0_max / 700.0)
+
+                        f0_mel = 1127.0 * np.log(1.0 + f0_np / 700.0)
+                        f0_mel[f0_mel > 0] = (
+                            (f0_mel[f0_mel > 0] - f0_mel_min) * 254.0 / (f0_mel_max - f0_mel_min) + 1.0
+                        )
+                        f0_mel[f0_mel <= 1] = 1
+                        f0_mel[f0_mel > 255] = 255
+                        f0_coarse = np.rint(f0_mel).astype(np.int64)
+
+                        pitch = torch.from_numpy(f0_coarse).unsqueeze(0).to(self.device)
+                        pitchf = torch.from_numpy(f0_np).float().unsqueeze(0).to(self.device)
+
+                        synth = self._net_g.infer(phone_100hz, phone_lengths, pitch, pitchf, sid)[0]
+                    else:
+                        synth = self._net_g.infer(phone_100hz, phone_lengths, sid)[0]
 
                     # Resample back to target rate (e.g. 40kHz -> 48kHz)
                     if self._resampler_to_target is not None:
@@ -190,7 +247,7 @@ class VoiceConverter:
 
                     out_np = synth.squeeze().cpu().numpy().astype(np.float32)
 
-                    # Length alignment without destructive interpolation
+                    # Length alignment without destructive truncation
                     if len(out_np) < n_samples:
                         out_np = np.pad(out_np, (0, n_samples - len(out_np)))
                     else:
@@ -199,7 +256,7 @@ class VoiceConverter:
                     # Output Peak Normalization
                     out_peak = float(np.max(np.abs(out_np)))
                     if out_peak > 1e-4:
-                        out_np = (out_np / out_peak) * min(0.85, max(0.5, peak_amp * 1.5))
+                        out_np = (out_np / out_peak) * 0.85
 
                     if self.device == "cuda":
                         torch.cuda.synchronize()
