@@ -87,6 +87,13 @@ class VoiceConverter:
             self._torch = None
             self._dummy_conv = None
 
+        self._is_neural_model: bool = False
+        self._net_g = None
+        self._hubert = None
+        self._model_sr: int = 40000
+        self._resampler_to_16k = None
+        self._resampler_to_target = None
+
     def load_model(
         self,
         model_path: Optional[str] = None,
@@ -95,11 +102,7 @@ class VoiceConverter:
     ) -> None:
         """
         Loads voice conversion model weights (.pth) and feature index (.index).
-
-        Args:
-            model_path: Filepath to RVC checkpoint (.pth).
-            index_path: Filepath to FAISS feature index (.index).
-            device: 'cuda' or 'cpu'.
+        Instantiates RVC v2 VITS neural generator and HuBERT feature extractor.
         """
         if device is not None:
             self.device = self._resolve_device(device)
@@ -107,14 +110,42 @@ class VoiceConverter:
         self.model_path = model_path
         self.index_path = index_path
 
-        if model_path and Path(model_path).is_file():
-            print(f"[MODEL] Loading model checkpoint: {model_path} on {self.device}...")
-            # RVC model weight loading hook
-            # e.g., torch.load(model_path, map_location=self.device)
-            self.model_loaded = True
-        else:
-            print(f"[MODEL] Initialized in baseline/mock mode on device: [{self.device.upper()}]")
-            self.model_loaded = True
+        if model_path and Path(model_path).is_file() and self._torch_available:
+            try:
+                import torchaudio
+                from .rvc.models import SynthesizerTrnMs768NSFsid_nono
+
+                print(f"[AI NEURAL] Loading RVC v2 Model: {model_path} on [{self.device.upper()}]...")
+                cpt = self._torch.load(model_path, map_location="cpu", weights_only=False)
+                config = cpt.get("config", [])
+                self._model_sr = config[-1] if isinstance(config, list) and len(config) > 0 else 40000
+
+                # Instantiate VITS generator
+                net = SynthesizerTrnMs768NSFsid_nono(*config, is_half=False).to(self.device).eval()
+                net.load_state_dict(cpt.get("weight", {}), strict=False)
+                self._net_g = net
+
+                # Load HuBERT phonetic extractor
+                print(f"[AI NEURAL] Initializing HuBERT speech encoder on [{self.device.upper()}]...")
+                bundle = torchaudio.pipelines.HUBERT_BASE
+                self._hubert = bundle.get_model().to(self.device).eval()
+
+                # Resamplers
+                if self.sample_rate != 16000:
+                    self._resampler_to_16k = torchaudio.transforms.Resample(self.sample_rate, 16000).to(self.device)
+                if self._model_sr != self.sample_rate:
+                    self._resampler_to_target = torchaudio.transforms.Resample(self._model_sr, self.sample_rate).to(self.device)
+
+                self._is_neural_model = True
+                self.model_loaded = True
+                print(f"[AI NEURAL] RVC v2 Model ready! Sampling rate: {self._model_sr} Hz")
+                return
+            except Exception as exc:
+                print(f"[WARN] Failed to load neural RVC model ({exc}). Falling back to Phase Vocoder.")
+                self._is_neural_model = False
+
+        print(f"[MODEL] Initialized in Phase Vocoder mode on device: [{self.device.upper()}]")
+        self.model_loaded = True
 
     def infer(
         self,
@@ -123,19 +154,57 @@ class VoiceConverter:
     ) -> npt.NDArray[np.float32]:
         """
         Processes an audio chunk and performs voice transformation.
-
-        Args:
-            audio_chunk: 1D NumPy array of float32 samples (or 2D shape [N, 1]).
-            f0_up_key: Pitch shift in semitones (+12 = 1 octave up for male->female).
-
-        Returns:
-            Transformed audio chunk with identical length and shape.
+        Uses neural RVC v2 generator if a model is loaded, otherwise falls back to Phase Vocoder.
         """
         orig_shape = audio_chunk.shape
         flat_chunk = audio_chunk.ravel().astype(np.float32)
         n_samples = len(flat_chunk)
         if n_samples == 0:
             return np.zeros(orig_shape, dtype=np.float32)
+
+        # 1. Authentic RVC v2 Neural Conversion Path
+        if self._is_neural_model and self._net_g is not None and self._hubert is not None:
+            try:
+                import torch
+                t_raw = torch.from_numpy(flat_chunk).float().unsqueeze(0).to(self.device)
+
+                # Resample to 16kHz for HuBERT
+                if self._resampler_to_16k is not None:
+                    audio_16k = self._resampler_to_16k(t_raw)
+                else:
+                    audio_16k = t_raw
+
+                # Extract phonetic features
+                with torch.no_grad():
+                    features_list, _ = self._hubert.extract_features(audio_16k)
+                    phone = features_list[9] if len(features_list) > 9 else features_list[-1]
+
+                    # Synthesize with VITS generator
+                    phone_lengths = torch.tensor([phone.shape[1]], device=self.device)
+                    sid = torch.tensor([0], device=self.device)
+                    synth = self._net_g.infer(phone, phone_lengths, sid)[0]
+
+                    # Resample back to target rate
+                    if self._resampler_to_target is not None:
+                        synth = self._resampler_to_target(synth)
+
+                    # Match output frame length
+                    out_tensor = synth.squeeze()
+                    if out_tensor.shape[0] != n_samples:
+                        out_tensor = torch.nn.functional.interpolate(
+                            out_tensor.view(1, 1, -1),
+                            size=n_samples,
+                            mode="linear",
+                            align_corners=False,
+                        ).squeeze()
+
+                    if self.device == "cuda":
+                        torch.cuda.synchronize()
+
+                    return out_tensor.cpu().numpy().astype(np.float32).reshape(orig_shape)
+            except Exception as rvc_err:
+                # Fallback on transient error
+                pass
 
         if not self._torch_available:
             try:

@@ -2,7 +2,7 @@
 Realtime AI Voice Changer (SonicShift) - Main Live Streaming Application
 
 Hooks microphone input into the high-performance RingBuffer pipeline,
-runs voice transformation (Male to Female pitch shifting & formant adaptation),
+runs voice transformation (Male to Female neural RVC v2 inference),
 and outputs to:
   1. CABLE Input (VB-Audio Virtual Cable) -> feeds into Discord/Game voice chat.
   2. Headphones (Dual-Monitoring) -> lets you hear your transformed voice live with zero delay.
@@ -18,6 +18,14 @@ import os
 from pathlib import Path
 from typing import Optional, Any
 import numpy as np
+
+# Ensure UTF-8 output on Windows consoles
+if sys.platform == "win32":
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+        sys.stderr.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
 
 # Ensure project root is in sys.path
 _project_root = Path(__file__).resolve().parent
@@ -55,7 +63,7 @@ def render_vu_bar(db: float, width: int = 20) -> str:
     clamped = max(-60.0, min(0.0, db))
     ratio = (clamped + 60.0) / 60.0
     filled = int(round(ratio * width))
-    bar = "█" * filled + "░" * (width - filled)
+    bar = "#" * filled + "-" * (width - filled)
     return f"[{bar}] {db:5.1f} dB"
 
 
@@ -131,9 +139,17 @@ def main() -> None:
     print("=" * 80)
 
     # 2. Initialize Voice Converter Engine
-    print("\n[AI ENGINE] Initializing Voice Converter...")
+    print("\n[AI ENGINE] Initializing Neural Voice Converter...")
     converter = VoiceConverter(sample_rate=SAMPLE_RATE, device=args.device)
-    converter.load_model(model_path=args.model, index_path=args.index, device=args.device)
+
+    # Auto-load default female checkpoint if --model not specified
+    model_to_use = args.model
+    if model_to_use is None:
+        default_ckpt = _project_root / "models" / "checkpoints" / "howatto_female.pth"
+        if default_ckpt.is_file():
+            model_to_use = str(default_ckpt)
+
+    converter.load_model(model_path=model_to_use, index_path=args.index, device=args.device)
     print(f"[AI ENGINE] Engine active on backend: [{converter.device.upper()}]")
 
     # State tracking

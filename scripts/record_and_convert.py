@@ -1,10 +1,10 @@
 """
 scripts/record_and_convert.py - Record & Audition Voice Changer Tool
 
-Records your voice from the microphone for a specified duration (e.g. 5 seconds)
-or until you press Enter, converts it from Male to Female using PyTorch CUDA on
-your NVIDIA RTX 3050, saves both the original and converted audio, and automatically
-opens the converted file so you can listen to it immediately!
+Records your voice from the microphone for a specified duration (e.g. 5 seconds),
+converts it from Male to Female using neural RVC v2 on your NVIDIA RTX 3050 GPU,
+saves both the original and converted audio files to recordings/, and automatically
+opens the converted file so you can audition the result immediately!
 """
 
 from __future__ import annotations
@@ -14,7 +14,16 @@ import os
 import sys
 import time
 from pathlib import Path
+from typing import Optional
 import numpy as np
+
+# Ensure UTF-8 output on Windows consoles
+if sys.platform == "win32":
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+        sys.stderr.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
 
 # Ensure project root is in sys.path
 _project_root = Path(__file__).resolve().parent.parent
@@ -47,22 +56,22 @@ def record_voice(
             else resolve_device_id(INPUT_DEVICE_NAME, INPUT_DEVICE_INDEX, is_input=True)
         )
     except Exception as exc:
-        print(f"[ERROR] Failed to resolve microphone: {exc}")
+        print(f"[ERROR] Khong tim thay microphone hop le: {exc}")
         sys.exit(1)
 
     dev_name = sd.query_devices(in_id)["name"]
     print("\n" + "=" * 70)
-    print(f" Micro thu âm : [{in_id}] {dev_name}")
-    print(f" Thời lượng   : {duration_sec:.1f} giây")
-    print(f" Tần số mẫu   : {sample_rate} Hz (Mono)")
+    print(f" Micro thu am    : [{in_id}] {dev_name}")
+    print(f" Thoi luong      : {duration_sec:.1f} giay")
+    print(f" Tan so lay mau  : {sample_rate} Hz (Mono)")
     print("=" * 70)
 
     # Countdown
-    print("\nChuẩn bị nói trong:")
+    print("\nChuan bi noi trong:")
     for count in [3, 2, 1]:
         print(f"  --> {count}...")
         time.sleep(1.0)
-    print("  >>> BẮT ĐẦU NÓI! <<<\n")
+    print("  >>> BAT DAU NOI! <<<\n")
 
     frames_total = int(duration_sec * sample_rate)
     recorded_frames: list[np.ndarray] = []
@@ -82,11 +91,10 @@ def record_voice(
     ):
         while time.time() - start_time < duration_sec:
             elapsed = time.time() - start_time
-            remaining = max(0.0, duration_sec - elapsed)
             pct = min(100.0, (elapsed / duration_sec) * 100)
             bar_len = 25
             filled = int(round((pct / 100.0) * bar_len))
-            bar = "█" * filled + "░" * (bar_len - filled)
+            bar = "#" * filled + "-" * (bar_len - filled)
 
             # Measure latest frame RMS
             if recorded_frames:
@@ -97,12 +105,12 @@ def record_voice(
                 db = -90.0
 
             sys.stdout.write(
-                f"\r Đang thu âm: [{bar}] {elapsed:4.1f}s / {duration_sec:4.1f}s | Âm lượng: {db:5.1f} dB  "
+                f"\r [Dang thu am]: [{bar}] {elapsed:4.1f}s / {duration_sec:4.1f}s | Muc am: {db:5.1f} dB  "
             )
             sys.stdout.flush()
             time.sleep(0.05)
 
-    print("\n\nThu âm hoàn tất!")
+    print("\n\nThu am hoan tat!")
     if not recorded_frames:
         return np.zeros((frames_total, 1), dtype=np.float32)
 
@@ -112,36 +120,48 @@ def record_voice(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Record and Audition Realtime AI Voice Changer")
-    parser.add_argument("--duration", "-d", type=float, default=5.0, help="Thời lượng thu âm (giây, mặc định: 5.0)")
-    parser.add_argument("--pitch", "-p", type=int, default=PITCH_SHIFT_SEMITONES, help="Độ dịch cao độ (+12 cho Nam sang Nữ)")
-    parser.add_argument("--input", "-i", type=int, default=None, help="Device index của micro (tùy chọn)")
-    parser.add_argument("--device", type=str, default=DEVICE, help="Thiết bị tính toán ('cuda' hoặc 'cpu')")
-    parser.add_argument("--play", action="store_true", default=True, help="Tự động mở file nghe lại sau khi xử lý xong")
+    parser.add_argument("--duration", "-d", type=float, default=5.0, help="Thoi luong thu am (giay, mac dinh: 5.0)")
+    parser.add_argument("--pitch", "-p", type=int, default=PITCH_SHIFT_SEMITONES, help="Do dich cao do (+12 cho Nam sang Nu)")
+    parser.add_argument("--input", "-i", type=int, default=None, help="Device index cua micro (tuy chon)")
+    parser.add_argument("--device", type=str, default=DEVICE, help="Thiet bi tinh toan ('cuda' hoac 'cpu')")
+    parser.add_argument("--model", "-m", type=str, default=None, help="Duong dan file model RVC .pth (mac dinh: howatto_female.pth)")
+    parser.add_argument("--play", action="store_true", default=True, help="Tu dong mo file nghe lai sau khi xu ly xong")
 
     args = parser.parse_args()
 
     try:
         import soundfile as sf
     except ImportError:
-        print("[ERROR] Cần cài thư viện soundfile: 'pip install soundfile'")
+        print("[ERROR] Can cai thu vien soundfile: 'pip install soundfile'")
         sys.exit(1)
 
-    # 1. Thu âm giọng gốc
+    # 1. Thu am giong goc
     raw_audio = record_voice(
         duration_sec=args.duration,
         sample_rate=SAMPLE_RATE,
         input_device=args.input,
     )
 
-    # 2. Xử lý chuyển giọng trên GPU RTX 3050
-    print("\n[AI GPU] Đang chuyển đổi giọng từ Nam sang Nữ bằng PyTorch CUDA...")
+    # 2. Xu ly chuyen giong tren GPU bang Neural RVC hoac Phase Vocoder
+    print("\n[AI GPU] Dang chuyen doi giong tu Nam sang Nu bang PyTorch CUDA...")
     t0 = time.perf_counter()
     converter = VoiceConverter(sample_rate=SAMPLE_RATE, device=args.device)
+
+    # Tu dong nap model howatto_female.pth neu co san
+    model_to_use = args.model
+    if model_to_use is None:
+        default_ckpt = _project_root / "models" / "checkpoints" / "howatto_female.pth"
+        if default_ckpt.is_file():
+            model_to_use = str(default_ckpt)
+
+    if model_to_use:
+        converter.load_model(model_path=model_to_use, device=args.device)
+
     converted_audio = converter.infer(raw_audio, f0_up_key=args.pitch)
     elapsed_ms = (time.perf_counter() - t0) * 1000.0
-    print(f"[AI GPU] Hoàn thành chuyển đổi trong {elapsed_ms:.2f} ms trên [{converter.device.upper()}]!")
+    print(f"[AI GPU] Hoan thanh chuyen doi trong {elapsed_ms:.2f} ms tren [{converter.device.upper()}]!")
 
-    # 3. Xuất file WAV
+    # 3. Xuat file WAV
     out_dir = _project_root / "recordings"
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -153,20 +173,20 @@ def main() -> None:
     sf.write(str(converted_path), converted_audio, SAMPLE_RATE)
 
     print("\n" + "=" * 70)
-    print(" KẾT QUẢ ĐÃ XUẤT RA FILE THÀNH CÔNG:")
+    print(" KET QUA DA XUAT RA FILE THANH CONG:")
     print("=" * 70)
-    print(f" 1. Giọng gốc của bạn      : {raw_path}")
-    print(f" 2. Giọng Nữ chuyển đổi    : {converted_path}")
+    print(f" 1. Giong goc cua ban       : {raw_path}")
+    print(f" 2. Giong Nu chuyen doi AI  : {converted_path}")
     print("=" * 70)
 
-    # 4. Tự động mở file để người dùng nghe lại
+    # 4. Tu dong mo file de nguoi dung nghe lai
     if args.play and os.name == "nt":
-        print("\n--> Đang mở file giọng nữ để bạn nghe lại...")
+        print("\n--> Dang mo file giong nu de ban nghe thu...")
         try:
             os.startfile(str(converted_path))
         except Exception as play_err:
-            print(f"[WARN] Không thể tự mở trình phát nhạc: {play_err}")
-            print(f"Bạn có thể mở thủ công tại: {converted_path}")
+            print(f"[WARN] Khong the tu mo trinh phat nhac: {play_err}")
+            print(f"Ban co the mo thu cong tai: {converted_path}")
 
 
 if __name__ == "__main__":
