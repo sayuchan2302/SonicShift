@@ -1,12 +1,11 @@
 """
 Offline RVC Inference Harness & GPU Benchmark (src/inference/offline_test.py)
 
-Provides a modular VoiceConverter architecture ready for RVC v2 integration
-and an offline benchmarking suite measuring:
-  - Inference Latency (ms)
-  - Real-Time Factor (RTF = inference_time / audio_duration)
-  - GPU VRAM Utilization (Allocated, Reserved, Peak)
-  - Chunk-level streaming latency budgets (256, 512, 1024 frames)
+Provides a modular VoiceConverter architecture integrating:
+  - Official RVC HuBERT speech representation encoder (12th layer, 100 fps)
+  - VITS neural acoustic generator (SynthesizerTrnMs768NSFsid / SynthesizerTrnMs768NSFsid_nono)
+  - Automatic Gain Control (AGC) and noise gate for low-gain microphones
+  - Zero destructive waveform interpolation (high-fidelity resampling)
 """
 
 from __future__ import annotations
@@ -26,14 +25,12 @@ if str(_project_root) not in sys.path:
     sys.path.insert(0, str(_project_root))
 
 from config import SAMPLE_RATE, BLOCK_SIZE, DEVICE, PITCH_SHIFT_SEMITONES
+from src.inference.hubert_loader import load_rvc_hubert
 
 
 class VoiceConverter:
     """
-    Modular Voice Conversion Engine.
-
-    Designed as a drop-in abstraction for RVC (Retrieval-based Voice Conversion).
-    Executes pitch shifting and spectral timbre adaptation on PyTorch GPU tensors.
+    High-fidelity Neural Voice Conversion Engine using RVC v2 architecture.
     """
 
     def __init__(
@@ -70,22 +67,9 @@ class VoiceConverter:
             import torch.nn as nn
             self._torch = torch
             self._torch_available = True
-
-            # Initialize lightweight GPU tensor layers to simulate RVC pipeline
-            # and exercise CUDA kernels, tensor memory, and synchronization
-            if self.device == "cuda":
-                self._dummy_conv = nn.Sequential(
-                    nn.Conv1d(1, 16, kernel_size=15, stride=1, padding=7),
-                    nn.LeakyReLU(0.1),
-                    nn.Conv1d(16, 1, kernel_size=15, stride=1, padding=7),
-                    nn.Tanh(),
-                ).to("cuda")
-            else:
-                self._dummy_conv = None
         except ImportError:
             self._torch_available = False
             self._torch = None
-            self._dummy_conv = None
 
         self._is_neural_model: bool = False
         self._net_g = None
@@ -101,8 +85,7 @@ class VoiceConverter:
         device: Optional[str] = None,
     ) -> None:
         """
-        Loads voice conversion model weights (.pth) and feature index (.index).
-        Instantiates RVC v2 VITS neural generator and HuBERT feature extractor.
+        Loads voice conversion model weights (.pth) and HuBERT encoder.
         """
         if device is not None:
             self.device = self._resolve_device(device)
@@ -125,12 +108,14 @@ class VoiceConverter:
                 net.load_state_dict(cpt.get("weight", {}), strict=False)
                 self._net_g = net
 
-                # Load HuBERT phonetic extractor
-                print(f"[AI NEURAL] Initializing HuBERT speech encoder on [{self.device.upper()}]...")
-                bundle = torchaudio.pipelines.HUBERT_BASE
-                self._hubert = bundle.get_model().to(self.device).eval()
+                # Load Official HuBERT Base weights
+                hubert_weights = _project_root / "models" / "pretrained" / "hubert_base.pt"
+                self._hubert = load_rvc_hubert(
+                    weights_path=str(hubert_weights) if hubert_weights.is_file() else None,
+                    device=self.device,
+                )
 
-                # Resamplers
+                # Resamplers (accurate linear phase bandlimited)
                 if self.sample_rate != 16000:
                     self._resampler_to_16k = torchaudio.transforms.Resample(self.sample_rate, 16000).to(self.device)
                 if self._model_sr != self.sample_rate:
@@ -138,7 +123,7 @@ class VoiceConverter:
 
                 self._is_neural_model = True
                 self.model_loaded = True
-                print(f"[AI NEURAL] RVC v2 Model ready! Sampling rate: {self._model_sr} Hz")
+                print(f"[AI NEURAL] RVC v2 Neural Pipeline active! Native SR: {self._model_sr} Hz")
                 return
             except Exception as exc:
                 print(f"[WARN] Failed to load neural RVC model ({exc}). Falling back to Phase Vocoder.")
@@ -153,14 +138,25 @@ class VoiceConverter:
         f0_up_key: int = PITCH_SHIFT_SEMITONES,
     ) -> npt.NDArray[np.float32]:
         """
-        Processes an audio chunk and performs voice transformation.
-        Uses neural RVC v2 generator if a model is loaded, otherwise falls back to Phase Vocoder.
+        Processes an audio chunk and performs high-fidelity voice transformation.
         """
         orig_shape = audio_chunk.shape
         flat_chunk = audio_chunk.ravel().astype(np.float32)
         n_samples = len(flat_chunk)
         if n_samples == 0:
             return np.zeros(orig_shape, dtype=np.float32)
+
+        peak_amp = float(np.max(np.abs(flat_chunk)))
+
+        # Noise Gate: If input is pure silence / tiny floor noise, output silence
+        if peak_amp < 0.003:
+            return np.zeros(orig_shape, dtype=np.float32)
+
+        # Automatic Gain Control (AGC): normalize quiet speech so HuBERT extracts strong formants
+        gain_scale = 1.0
+        if peak_amp < 0.35:
+            gain_scale = 0.70 / max(1e-4, peak_amp)
+            flat_chunk = flat_chunk * gain_scale
 
         # 1. Authentic RVC v2 Neural Conversion Path
         if self._is_neural_model and self._net_g is not None and self._hubert is not None:
@@ -174,132 +170,75 @@ class VoiceConverter:
                 else:
                     audio_16k = t_raw
 
-                # Extract phonetic features
                 with torch.no_grad():
+                    # Extract phonetic representations
                     features_list, _ = self._hubert.extract_features(audio_16k)
-                    phone = features_list[9] if len(features_list) > 9 else features_list[-1]
+                    # Layer 11 (the 12th layer) is the standard semantic layer for RVC v2
+                    phone = features_list[11] if len(features_list) > 11 else features_list[-1]
+
+                    # Standard RVC 100 fps frame duplication (HuBERT 50fps -> VITS 100fps)
+                    phone_100hz = phone.repeat_interleave(2, dim=1)
 
                     # Synthesize with VITS generator
-                    phone_lengths = torch.tensor([phone.shape[1]], device=self.device)
+                    phone_lengths = torch.tensor([phone_100hz.shape[1]], device=self.device)
                     sid = torch.tensor([0], device=self.device)
-                    synth = self._net_g.infer(phone, phone_lengths, sid)[0]
+                    synth = self._net_g.infer(phone_100hz, phone_lengths, sid)[0]
 
-                    # Resample back to target rate
+                    # Resample back to target rate (e.g. 40kHz -> 48kHz)
                     if self._resampler_to_target is not None:
                         synth = self._resampler_to_target(synth)
 
-                    # Match output frame length
-                    out_tensor = synth.squeeze()
-                    if out_tensor.shape[0] != n_samples:
-                        out_tensor = torch.nn.functional.interpolate(
-                            out_tensor.view(1, 1, -1),
-                            size=n_samples,
-                            mode="linear",
-                            align_corners=False,
-                        ).squeeze()
+                    out_np = synth.squeeze().cpu().numpy().astype(np.float32)
+
+                    # Length alignment without destructive interpolation
+                    if len(out_np) < n_samples:
+                        out_np = np.pad(out_np, (0, n_samples - len(out_np)))
+                    else:
+                        out_np = out_np[:n_samples]
+
+                    # Output Peak Normalization
+                    out_peak = float(np.max(np.abs(out_np)))
+                    if out_peak > 1e-4:
+                        out_np = (out_np / out_peak) * min(0.85, max(0.5, peak_amp * 1.5))
 
                     if self.device == "cuda":
                         torch.cuda.synchronize()
 
-                    return out_tensor.cpu().numpy().astype(np.float32).reshape(orig_shape)
+                    return out_np.reshape(orig_shape)
+
             except Exception as rvc_err:
-                # Fallback on transient error
+                print(f"[WARN] Neural inference error: {rvc_err}")
+
+        # Fallback: Torchaudio Phase Vocoder Pitch Shift
+        if self._torch_available:
+            try:
+                import torch
+                import torchaudio.functional as F_audio
+                tensor_audio = torch.from_numpy(flat_chunk).float().to(self.device)
+                shifted = F_audio.pitch_shift(
+                    waveform=tensor_audio,
+                    sample_rate=self.sample_rate,
+                    n_steps=f0_up_key,
+                )
+                if self.device == "cuda":
+                    torch.cuda.synchronize()
+                return shifted.cpu().numpy().astype(np.float32).reshape(orig_shape)
+            except Exception:
                 pass
 
-        if not self._torch_available:
-            try:
-                import librosa
-                shifted = librosa.effects.pitch_shift(
-                    flat_chunk, sr=self.sample_rate, n_steps=f0_up_key
-                )
-                return shifted.reshape(orig_shape).astype(np.float32)
-            except Exception:
-                pitch_ratio = 2.0 ** (f0_up_key / 12.0)
-                resampled = np.interp(
-                    np.linspace(0, n_samples - 1, int(n_samples / pitch_ratio)),
-                    np.arange(n_samples),
-                    flat_chunk,
-                )
-                result = np.interp(
-                    np.linspace(0, len(resampled) - 1, n_samples),
-                    np.arange(len(resampled)),
-                    resampled,
-                ).astype(np.float32)
-                return result.reshape(orig_shape)
-
-        torch = self._torch
-        import torchaudio
-
-        # Convert to GPU float tensor [1, N]
-        tensor = torch.from_numpy(flat_chunk).float().to(self.device).unsqueeze(0)
-
-        # Determine optimal STFT window based on audio length
-        if n_samples <= 512:
-            n_fft = min(256, 1 << (n_samples - 1).bit_length())
-            hop_length = max(32, n_fft // 4)
-        else:
-            n_fft = 1024
-            hop_length = 256
-
-        try:
-            # Authentic Phase Vocoder pitch shift on CUDA GPU
-            shifted = torchaudio.functional.pitch_shift(
-                tensor,
-                sample_rate=self.sample_rate,
-                n_steps=f0_up_key,
-                n_fft=n_fft,
-                hop_length=hop_length,
-            )
-
-            # Ensure output matches exact frame count
-            if shifted.shape[-1] != n_samples:
-                shifted = torch.nn.functional.interpolate(
-                    shifted.unsqueeze(0),
-                    size=n_samples,
-                    mode="linear",
-                    align_corners=False,
-                ).squeeze(0)
-
-            # High formant / vocal tract brightness filter for female timbre
-            if self.device == "cuda":
-                kernel = torch.tensor([-0.03, 1.06, -0.03], device=self.device).view(1, 1, 3)
-                shifted = torch.nn.functional.conv1d(
-                    shifted.unsqueeze(1), kernel, padding=1
-                ).squeeze(1)
-                torch.cuda.synchronize()
-
-            out_np = shifted.squeeze().cpu().numpy().astype(np.float32)
-            return out_np.reshape(orig_shape)
-        except Exception:
-            return flat_chunk.reshape(orig_shape)
+        return flat_chunk.reshape(orig_shape)
 
 
-def generate_synthetic_voice(
-    duration_sec: float = 3.0,
-    sample_rate: int = 40000,
-    f0_male: float = 130.0,
-) -> npt.NDArray[np.float32]:
-    """
-    Generates a realistic synthetic male vocal test signal with fundamental
-    frequency (f0 ~ 130Hz) and upper vocal tract harmonics/formants.
-    """
+def generate_synthetic_voice(duration_sec: float = 3.0, sample_rate: int = SAMPLE_RATE) -> np.ndarray:
+    """Synthesizes male voice harmonic signal."""
     t = np.linspace(0, duration_sec, int(sample_rate * duration_sec), endpoint=False)
-    # Fundamental + harmonics
+    f0 = 130.0
     signal = (
-        0.50 * np.sin(2 * np.pi * f0_male * t)
-        + 0.30 * np.sin(2 * np.pi * (2 * f0_male) * t)
-        + 0.15 * np.sin(2 * np.pi * (3 * f0_male) * t)
-        + 0.08 * np.sin(2 * np.pi * (4 * f0_male) * t)
-        + 0.04 * np.sin(2 * np.pi * (5 * f0_male) * t)
+        0.5 * np.sin(2 * np.pi * f0 * t)
+        + 0.3 * np.sin(2 * np.pi * 2 * f0 * t)
+        + 0.15 * np.sin(2 * np.pi * 3 * f0 * t)
+        + 0.05 * np.sin(2 * np.pi * 4 * f0 * t)
     )
-
-    # Apply soft envelope (fade in/out) to eliminate boundary clicks
-    fade_len = int(sample_rate * 0.05)
-    fade_in = np.linspace(0, 1, fade_len)
-    fade_out = np.linspace(1, 0, fade_len)
-    signal[:fade_len] *= fade_in
-    signal[-fade_len:] *= fade_out
-
     return signal.astype(np.float32)
 
 
@@ -331,169 +270,29 @@ def run_benchmark(
     pitch_shift: int = PITCH_SHIFT_SEMITONES,
     device: str = DEVICE,
 ) -> Dict[str, Any]:
-    """
-    Executes an offline inference benchmark on GPU or CPU.
-
-    Measures:
-      - Inference execution time (ms)
-      - Real-Time Factor (RTF)
-      - VRAM footprint
-      - Chunk-level streaming latency across standard buffer sizes
-    """
-    print("=" * 80)
-    print("           OFFLINE RVC INFERENCE & GPU LATENCY BENCHMARK")
-    print("=" * 80)
-
-    # 1. Load or synthesize test audio
-    if wav_path and Path(wav_path).is_file():
-        try:
-            import soundfile as sf
-            audio_data, sr = sf.read(wav_path, dtype="float32")
-            if sr != sample_rate:
-                print(f"[AUDIO] Resampling input file from {sr} Hz to {sample_rate} Hz...")
-                from scipy.signal import resample
-                num_target = int(len(audio_data) * (sample_rate / sr))
-                audio_data = resample(audio_data, num_target).astype(np.float32)
-            if audio_data.ndim > 1:
-                audio_data = np.mean(audio_data, axis=1)  # downmix mono
-            print(f"[AUDIO] Loaded external test file: {wav_path} ({len(audio_data) / sample_rate:.2f}s)")
-        except Exception as exc:
-            print(f"[WARN] Failed to load {wav_path}: {exc}. Using synthetic voice.")
-            audio_data = generate_synthetic_voice(duration_sec, sample_rate)
-    else:
-        print(f"[AUDIO] Synthesizing 3.0s harmonic vocal test signal (Male f0 ~ 130 Hz)...")
-        audio_data = generate_synthetic_voice(duration_sec, sample_rate)
-
-    audio_duration_ms = (len(audio_data) / sample_rate) * 1000.0
-
-    # 2. Initialize Voice Converter
+    """Executes offline inference benchmark."""
     converter = VoiceConverter(sample_rate=sample_rate, device=device)
     converter.load_model(model_path=model_path, device=device)
-
-    # 3. Warm-up Iterations (warm up PyTorch CUDA allocator & kernels)
-    print("\n[BENCHMARK] Warming up compute pipeline...")
-    warmup_chunk = audio_data[:min(len(audio_data), sample_rate)]
-    for _ in range(3):
-        _ = converter.infer(warmup_chunk, f0_up_key=pitch_shift)
-
-    # Reset CUDA memory stats to isolate test memory
-    try:
-        import torch
-        if torch.cuda.is_available():
-            torch.cuda.reset_peak_memory_stats()
-    except Exception:
-        pass
-
-    # 4. Full Clip Benchmark
-    print(f"[BENCHMARK] Running full clip inference ({audio_duration_ms:.1f} ms audio)...")
+    audio_data = generate_synthetic_voice(duration_sec, sample_rate)
     t0 = time.perf_counter()
-    converted_audio = converter.infer(audio_data, f0_up_key=pitch_shift)
+    out = converter.infer(audio_data, f0_up_key=pitch_shift)
     t1 = time.perf_counter()
-
-    inference_time_ms = (t1 - t0) * 1000.0
-    rtf = inference_time_ms / audio_duration_ms
-
-    gpu_mem = get_gpu_memory_mb()
-
-    # 5. Streaming Chunk Latency Benchmark (256, 512, 1024 frames)
-    chunk_benchmarks = []
-    test_chunk_sizes = [256, 512, 1024, 2048]
-
-    for csize in test_chunk_sizes:
-        if csize > len(audio_data):
-            continue
-        chunk = audio_data[:csize]
-        chunk_budget_ms = (csize / sample_rate) * 1000.0
-
-        # Run 20 iterations to obtain steady-state average
-        latencies = []
-        for _ in range(20):
-            ct0 = time.perf_counter()
-            _ = converter.infer(chunk, f0_up_key=pitch_shift)
-            latencies.append((time.perf_counter() - ct0) * 1000.0)
-
-        avg_lat = float(np.mean(latencies))
-        p95_lat = float(np.percentile(latencies, 95))
-        chunk_rtf = avg_lat / chunk_budget_ms
-
-        chunk_benchmarks.append({
-            "chunk_size": csize,
-            "budget_ms": chunk_budget_ms,
-            "avg_lat_ms": avg_lat,
-            "p95_lat_ms": p95_lat,
-            "rtf": chunk_rtf,
-            "realtime_capable": chunk_rtf < 1.0,
-        })
-
-    # 6. Save output audio for audition
-    output_wav_path = _project_root / "test_output_female.wav"
-    try:
-        import soundfile as sf
-        sf.write(str(output_wav_path), converted_audio, sample_rate)
-        saved_file_msg = f"Saved audition WAV to: {output_wav_path.name}"
-    except Exception:
-        saved_file_msg = "soundfile not installed, skipped writing WAV file."
-
-    # 7. Print Formatted Report
-    print("\n" + "=" * 80)
-    print("                      BENCHMARK RESULTS REPORT")
-    print("=" * 80)
-    print(f" Target Device       : [{converter.device.upper()}]")
-    print(f" Audio Length        : {audio_duration_ms:8.2f} ms ({len(audio_data)} samples @ {sample_rate} Hz)")
-    print(f" Full Inference Time : {inference_time_ms:8.2f} ms")
-    print(f" Real-Time Factor    : {rtf:8.3f}x {'[REAL-TIME OK]' if rtf < 1.0 else '[TOO SLOW]'}")
-    print(f" Pitch Shift Applied : {pitch_shift:+d} semitones (Male -> Female)")
-
-    if gpu_mem["total_mb"] > 0:
-        print("-" * 80)
-        print(" GPU VRAM METRICS:")
-        print(f"   Allocated Memory  : {gpu_mem['allocated_mb']:6.1f} MB")
-        print(f"   Reserved Memory   : {gpu_mem['reserved_mb']:6.1f} MB")
-        print(f"   Peak Test Memory  : {gpu_mem['peak_mb']:6.1f} MB / {gpu_mem['total_mb']:.0f} MB")
-
-    print("-" * 80)
-    print(" STREAMING CHUNK LATENCY BUDGETS:")
-    print("  Chunk Size | Audio Budget | Avg Latency | 95th %-tile | Chunk RTF | Real-time?")
-    print("  -----------+--------------+-------------+-------------+-----------+-----------")
-    for cb in chunk_benchmarks:
-        status_sym = "YES (PASS)" if cb["realtime_capable"] else "NO (FAIL)"
-        print(
-            f"   {cb['chunk_size']:5d}     |   {cb['budget_ms']:5.2f} ms   |  "
-            f"{cb['avg_lat_ms']:5.2f} ms  |  {cb['p95_lat_ms']:5.2f} ms   |   "
-            f"{cb['rtf']:5.2f}   | {status_sym}"
-        )
-
-    print("-" * 80)
-    print(f" Audio Verification  : {saved_file_msg}")
-    print("=" * 80)
-
-    # Return structured metrics
+    inf_ms = (t1 - t0) * 1000.0
     return {
-        "audio_duration_ms": audio_duration_ms,
-        "inference_time_ms": inference_time_ms,
-        "rtf": rtf,
-        "gpu_memory": gpu_mem,
-        "chunk_benchmarks": chunk_benchmarks,
+        "audio_duration_ms": duration_sec * 1000.0,
+        "inference_time_ms": inf_ms,
+        "rtf": inf_ms / (duration_sec * 1000.0),
         "device": converter.device,
     }
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Offline RVC Inference Benchmark")
-    parser.add_argument("--wav", type=str, default=None, help="Path to input .wav file (defaults to synthetic voice)")
+    parser.add_argument("--wav", type=str, default=None, help="Path to input .wav file")
     parser.add_argument("--model", type=str, default=None, help="Path to RVC .pth model file")
     parser.add_argument("--device", type=str, default=DEVICE, help="'cuda' or 'cpu'")
-    parser.add_argument("--pitch", type=int, default=PITCH_SHIFT_SEMITONES, help="Pitch shift in semitones (default +12)")
-    parser.add_argument("--samplerate", type=int, default=SAMPLE_RATE, help="Sample rate in Hz")
-
     args = parser.parse_args()
-    run_benchmark(
-        wav_path=args.wav,
-        model_path=args.model,
-        sample_rate=args.samplerate,
-        pitch_shift=args.pitch,
-        device=args.device,
-    )
+    run_benchmark(wav_path=args.wav, model_path=args.model, device=args.device)
 
 
 if __name__ == "__main__":

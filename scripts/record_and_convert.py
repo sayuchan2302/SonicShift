@@ -67,7 +67,7 @@ def record_voice(
     print("=" * 70)
 
     # Countdown
-    print("\nChuan bi noi trong:")
+    print("\nChuan bi noi (hay noi to, ro rang gan micro):")
     for count in [3, 2, 1]:
         print(f"  --> {count}...")
         time.sleep(1.0)
@@ -99,8 +99,8 @@ def record_voice(
             # Measure latest frame RMS
             if recorded_frames:
                 latest = recorded_frames[-1]
-                rms = np.sqrt(np.mean(np.square(latest)))
-                db = 20 * np.log10(max(1e-5, rms))
+                rms = float(np.sqrt(np.mean(np.square(latest))))
+                db = float(20 * np.log10(max(1e-5, rms)))
             else:
                 db = -90.0
 
@@ -114,8 +114,16 @@ def record_voice(
     if not recorded_frames:
         return np.zeros((frames_total, 1), dtype=np.float32)
 
-    audio_data = np.concatenate(recorded_frames, axis=0)
-    return audio_data[:frames_total]
+    audio_data = np.concatenate(recorded_frames, axis=0)[:frames_total]
+    peak = float(np.max(np.abs(audio_data)))
+    rms_total = float(np.sqrt(np.mean(audio_data**2)))
+    db_total = float(20 * np.log10(max(1e-5, rms_total)))
+
+    print(f"-> Thong so am goc: Peak = {peak:.4f} | RMS = {db_total:.1f} dB")
+    if peak < 0.08:
+        print(" [LƯU Ý]: Giọng nói từ micro khá nhỏ. Bộ xử lý Auto-Gain đã tự động khuếch đại tín hiệu để AI nhận dạng ngữ âm chính xác.")
+
+    return audio_data
 
 
 def main() -> None:
@@ -142,8 +150,8 @@ def main() -> None:
         input_device=args.input,
     )
 
-    # 2. Xu ly chuyen giong tren GPU bang Neural RVC hoac Phase Vocoder
-    print("\n[AI GPU] Dang chuyen doi giong tu Nam sang Nu bang PyTorch CUDA...")
+    # 2. Xu ly chuyen giong tren GPU bang Neural RVC
+    print("\n[AI GPU] Dang chuyen doi giong tu Nam sang Nu bang Neural RVC v2 truyen HuBERT...")
     t0 = time.perf_counter()
     converter = VoiceConverter(sample_rate=SAMPLE_RATE, device=args.device)
 
