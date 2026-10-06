@@ -1,8 +1,8 @@
 """
-Configuration module for the Realtime AI Voice Changer.
+Configuration module for the Realtime AI Voice Changer (SonicShift).
 
 Provides strongly typed configuration settings with automatic environment
-variable loading from a local .env file, fallback defaults, and device resolution
+variable loading from a local .env file, fallback defaults, and smart device resolution
 helpers for low-latency audio streaming with sounddevice.
 """
 
@@ -76,13 +76,13 @@ class VoiceChangerConfig:
     """Strongly-typed runtime configuration parameters."""
 
     # Audio Signal Processing
-    sample_rate: int = field(default_factory=lambda: _get_env_int("SAMPLE_RATE", 40000))
+    sample_rate: int = field(default_factory=lambda: _get_env_int("SAMPLE_RATE", 48000))
     block_size: int = field(default_factory=lambda: _get_env_int("BLOCK_SIZE", 256))
     channels: int = field(default_factory=lambda: _get_env_int("CHANNELS", 1))
 
     # Hardware & Audio Routing
     input_device_name: Optional[str] = field(
-        default_factory=lambda: os.getenv("INPUT_DEVICE_NAME", "").strip() or None
+        default_factory=lambda: os.getenv("INPUT_DEVICE_NAME", "Microphone").strip() or None
     )
     input_device_index: Optional[int] = field(
         default_factory=lambda: _get_env_optional_int("INPUT_DEVICE_INDEX")
@@ -136,7 +136,6 @@ class VoiceChangerConfig:
 config = VoiceChangerConfig()
 
 # Global module aliases for direct imports:
-# e.g., from config import SAMPLE_RATE, BLOCK_SIZE
 SAMPLE_RATE: int = config.sample_rate
 BLOCK_SIZE: int = config.block_size
 CHANNELS: int = config.channels
@@ -160,6 +159,7 @@ def resolve_device_id(
     """
     Resolves the exact SoundDevice device ID based on explicit index or substring name match.
     Prefers Windows WASAPI devices for lowest latency on Windows.
+    Smart scoring avoids picking empty 'External Microphone' jacks over built-in Microphones.
 
     Args:
         name_query: Substring to match in device name (e.g. 'CABLE Input', 'Microphone')
@@ -197,7 +197,7 @@ def resolve_device_id(
             f"Device index {explicit_index} is out of range [0, {len(devices) - 1}]."
         )
 
-    # 2. If name query is provided, search matching devices
+    # 2. If name query is provided, search matching devices with smart scoring
     if name_query:
         query_lower = name_query.lower()
         candidates = []
@@ -206,11 +206,22 @@ def resolve_device_id(
             if max_ch > 0 and query_lower in dev["name"].lower():
                 api_name = host_apis[dev["hostapi"]]["name"]
                 is_wasapi = "wasapi" in api_name.lower()
-                candidates.append((idx, dev, is_wasapi))
+                name_l = dev["name"].lower()
+
+                # Prioritize:
+                # 1. WASAPI over MME / DirectSound
+                # 2. If query does not mention "external", penalize "external microphone" (often an empty 3.5mm jack)
+                # 3. Names starting with the query (e.g. "Microphone (Realtek)" over "External Microphone")
+                wasapi_score = 1 if is_wasapi else 0
+                is_external_jack = 1 if ("external" in name_l and "external" not in query_lower) else 0
+                starts_with = 1 if name_l.startswith(query_lower) else 0
+
+                score = (wasapi_score, -is_external_jack, starts_with)
+                candidates.append((idx, dev, score))
 
         if candidates:
-            # Sort candidates: prefer WASAPI for lowest latency and jitter
-            candidates.sort(key=lambda c: (1 if c[2] else 0), reverse=True)
+            # Sort candidates by highest score
+            candidates.sort(key=lambda c: c[2], reverse=True)
             return candidates[0][0]
 
         raise RuntimeError(
