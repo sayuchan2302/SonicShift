@@ -1,0 +1,28 @@
+﻿# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*.class
+
+# Virtual environments
+venv/
+env/
+ENV/
+.venv/
+
+# Local Environment Variables & hardware overrides
+.env
+!.env.example
+
+# Large test audio files & weights
+*.wav
+*.pth
+*.index
+
+# IDE / Editor
+.vscode/
+.idea/
+
+# OS specific
+Thumbs.db
+Desktop.ini
+.DS_Store

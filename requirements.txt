@@ -1,0 +1,39 @@
+# ==============================================================================
+# Realtime AI Voice Changer - Requirements Specification
+# Target Platform: Windows 10/11 x64 with NVIDIA CUDA GPU
+# Python Version: 3.10+ (Recommended: 3.10 - 3.12)
+# ==============================================================================
+#
+# CRITICAL INSTALLATION NOTE FOR PYTORCH WITH CUDA ACCELERATION:
+# Standard PyPI wheels for torch do NOT include CUDA binaries by default.
+# Install PyTorch with CUDA 12.1 or 12.4 first using the official wheel index:
+#
+#   pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu121
+#
+# Then install the remaining dependencies:
+#   pip install -r requirements.txt
+#
+# ==============================================================================
+
+# Core Audio I/O & Digital Signal Processing
+sounddevice>=0.4.6              # Low-latency PortAudio bindings with WASAPI support
+soundfile>=0.12.1                # Fast WAV / FLAC I/O via libsndfile
+numpy>=1.24.0,<2.0.0            # Matrix computation (pinned <2.0 for ecosystem compatibility)
+scipy>=1.11.0                   # Resampling, butterworth filters, signal processing
+librosa>=0.10.1                 # Audio analysis, STFT, pitch & spectral representations
+
+# Environment & Configuration Management
+python-dotenv>=1.0.0            # Load .env configurations into environment
+
+# Deep Learning & Pitch Extraction (CUDA accelerated)
+# Note: Ensure torch is installed via the CUDA index URL above.
+torch>=2.2.0
+torchaudio>=2.2.0
+torchcrepe>=0.0.22              # High-accuracy neural pitch tracker (CREPE) on GPU
+
+# Feature Retrieval (RVC Indexing)
+faiss-cpu>=1.7.4                # Vector similarity search for voice timbre retrieval
+
+# Performance & Utilities
+tqdm>=4.66.0                    # Progress metrics for batch audio processing
+tabulate>=0.9.0                 # Pretty printing device tables in CLI utilities
