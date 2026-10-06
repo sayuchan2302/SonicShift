@@ -5,6 +5,11 @@ Decouples low-latency OS audio driver callbacks (PortAudio) from heavy AI infere
 workloads using dual Ring Buffers (Input Ring Buffer & Output Ring Buffer) and a
 dedicated processing worker thread.
 
+Supports Dual-Output Monitoring:
+Routes converted female voice simultaneously to:
+  1. CABLE Input (VB-Audio Virtual Cable) -> feeds into Discord/Games.
+  2. Headphones (Optional Monitor Stream) -> allows the user to hear their transformed voice live.
+
 Architecture:
   [Physical Mic]
         │
@@ -13,12 +18,8 @@ Architecture:
   [Input Ring Buffer]
         │
   (Worker Thread - Consumer & Producer) -> [AI Voice Converter]
-        ▼
-  [Output Ring Buffer]
-        │
-  (Audio Callback - Consumer)
-        ▼
-  [CABLE Input (VB-Audio Virtual Cable)]
+        ├──► [Output Ring Buffer]  ──► (OutputStream Callback) ──► [CABLE Input (Discord/Game)]
+        └──► [Monitor Ring Buffer] ──► (MonitorStream Callback) ──► [Headphones (Live Ears)]
 """
 
 from __future__ import annotations
@@ -52,7 +53,7 @@ class AudioPipelineMetrics:
 
 class AudioStreamManager:
     """
-    Manages dual-stream audio capture and playback with a decoupled worker thread.
+    Manages multi-stream audio capture, processing, and optional live headphone monitoring.
     """
 
     def __init__(
@@ -62,6 +63,8 @@ class AudioStreamManager:
         channels: int = 1,
         input_device: Optional[Union[int, str]] = None,
         output_device: Optional[Union[int, str]] = None,
+        monitor_device: Optional[Union[int, str]] = None,
+        monitor_volume: float = 1.0,
         latency_preset: Union[str, float] = "low",
         buffer_blocks: int = 64,
         process_callback: Optional[Callable[[npt.NDArray[np.float32]], npt.NDArray[np.float32]]] = None,
@@ -75,6 +78,8 @@ class AudioStreamManager:
             channels: Number of audio channels (1 for mono).
             input_device: Sounddevice index or name for capture (Mic).
             output_device: Sounddevice index or name for playback (VB-Cable).
+            monitor_device: Optional Sounddevice index for headphones monitor.
+            monitor_volume: Volume multiplier for headphone monitoring [0.0 - 1.0].
             latency_preset: 'low', 'high', or duration in seconds.
             buffer_blocks: Ring buffer capacity in units of block_size.
             process_callback: Audio processing callback: f(chunk) -> transformed_chunk.
@@ -84,6 +89,8 @@ class AudioStreamManager:
         self.channels: int = channels
         self.input_device = input_device
         self.output_device = output_device
+        self.monitor_device = monitor_device
+        self.monitor_volume = float(np.clip(monitor_volume, 0.0, 1.0))
         self.latency_preset = latency_preset
         self.process_callback = process_callback or (lambda x: x)
 
@@ -91,11 +98,19 @@ class AudioStreamManager:
         self.input_buffer = RingBuffer(capacity_frames=capacity_frames, channels=self.channels)
         self.output_buffer = RingBuffer(capacity_frames=capacity_frames, channels=self.channels)
 
+        # Optional separate monitor buffer for headphones
+        self.monitor_buffer: Optional[RingBuffer] = (
+            RingBuffer(capacity_frames=capacity_frames, channels=self.channels)
+            if self.monitor_device is not None
+            else None
+        )
+
         self._is_running = threading.Event()
         self._worker_thread: Optional[threading.Thread] = None
 
         self._in_stream: Optional[Any] = None
         self._out_stream: Optional[Any] = None
+        self._mon_stream: Optional[Any] = None
 
         # Telemetry metrics
         self.metrics = AudioPipelineMetrics()
@@ -136,10 +151,24 @@ class AudioStreamManager:
         chunk = self.output_buffer.read(frames, fill_zeros_on_underrun=True)
         outdata[:] = chunk
 
+    def _monitor_callback(
+        self,
+        outdata: np.ndarray,
+        frames: int,
+        time_info: Any,
+        status: Any,
+    ) -> None:
+        """PortAudio monitor callback: outputs transformed voice into headphones for self-listening."""
+        if self.monitor_buffer is not None:
+            chunk = self.monitor_buffer.read(frames, fill_zeros_on_underrun=True)
+            outdata[:] = chunk * self.monitor_volume
+        else:
+            outdata.fill(0)
+
     def _worker_loop(self) -> None:
         """
         Background worker thread: Consumes audio chunks from input buffer,
-        runs transformation/inference callback, and writes to output buffer.
+        runs transformation/inference callback, and writes to output & monitor buffers.
         """
         block_duration_sec = self.block_size / self.sample_rate
 
@@ -147,7 +176,6 @@ class AudioStreamManager:
             # Check if at least one block is available to process
             available = self.input_buffer.available_read()
             if available < self.block_size:
-                # Sleep a fraction of block duration to prevent busy spinning
                 time.sleep(block_duration_sec * 0.25)
                 continue
 
@@ -160,8 +188,7 @@ class AudioStreamManager:
             t0 = time.perf_counter()
             try:
                 processed_chunk = self.process_callback(chunk)
-            except Exception as exc:
-                # Safety fallback: passthrough uncorrupted audio if worker throws
+            except Exception:
                 processed_chunk = chunk
 
             dt_ms = (time.perf_counter() - t0) * 1000.0
@@ -173,8 +200,14 @@ class AudioStreamManager:
                 self._process_times.pop(0)
             self.metrics.avg_process_time_ms = sum(self._process_times) / len(self._process_times)
 
-            # Write transformed audio into output ring buffer
-            self.output_buffer.write(processed_chunk.astype(np.float32), drop_oldest_on_overflow=True)
+            proc_f32 = processed_chunk.astype(np.float32)
+
+            # Write transformed audio into output ring buffer (VB-Cable)
+            self.output_buffer.write(proc_f32, drop_oldest_on_overflow=True)
+
+            # Write into headphone monitor buffer if enabled
+            if self.monitor_buffer is not None:
+                self.monitor_buffer.write(proc_f32, drop_oldest_on_overflow=True)
 
     def start(self) -> None:
         """Starts input/output streams and the audio worker thread."""
@@ -188,6 +221,9 @@ class AudioStreamManager:
 
         self.input_buffer.clear()
         self.output_buffer.clear()
+        if self.monitor_buffer is not None:
+            self.monitor_buffer.clear()
+
         self._is_running.set()
 
         # Start worker thread
@@ -198,7 +234,7 @@ class AudioStreamManager:
         )
         self._worker_thread.start()
 
-        # Open Input stream
+        # Open Input stream (Mic)
         self._in_stream = sd.InputStream(
             device=self.input_device,
             samplerate=self.sample_rate,
@@ -209,7 +245,7 @@ class AudioStreamManager:
             callback=self._input_callback,
         )
 
-        # Open Output stream
+        # Open Primary Output stream (VB-Cable)
         self._out_stream = sd.OutputStream(
             device=self.output_device,
             samplerate=self.sample_rate,
@@ -222,6 +258,23 @@ class AudioStreamManager:
 
         self._in_stream.start()
         self._out_stream.start()
+
+        # Open Monitor Output stream (Headphones) if specified
+        if self.monitor_device is not None:
+            try:
+                self._mon_stream = sd.OutputStream(
+                    device=self.monitor_device,
+                    samplerate=self.sample_rate,
+                    blocksize=self.block_size,
+                    channels=self.channels,
+                    dtype="float32",
+                    latency=self.latency_preset,
+                    callback=self._monitor_callback,
+                )
+                self._mon_stream.start()
+            except Exception as mon_err:
+                print(f"[WARN] Failed to initialize monitor stream on device {self.monitor_device}: {mon_err}")
+                self._mon_stream = None
 
         # Store measured driver latencies
         in_lat = getattr(self._in_stream, "latency", 0.0)
@@ -256,6 +309,14 @@ class AudioStreamManager:
             except Exception:
                 pass
             self._out_stream = None
+
+        if self._mon_stream:
+            try:
+                self._mon_stream.stop()
+                self._mon_stream.close()
+            except Exception:
+                pass
+            self._mon_stream = None
 
     def is_active(self) -> bool:
         """Returns True if streams and worker thread are active."""

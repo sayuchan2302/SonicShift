@@ -1,9 +1,11 @@
 """
-Realtime AI Voice Changer - Main Live Streaming Application
+Realtime AI Voice Changer (SonicShift) - Main Live Streaming Application
 
 Hooks microphone input into the high-performance RingBuffer pipeline,
 runs voice transformation (Male to Female pitch shifting & formant adaptation),
-and outputs to Headphones (for monitoring) or VB-Audio Virtual Cable (for games/Discord).
+and outputs to:
+  1. CABLE Input (VB-Audio Virtual Cable) -> feeds into Discord/Game voice chat.
+  2. Headphones (Dual-Monitoring) -> lets you hear your transformed voice live with zero delay.
 """
 
 from __future__ import annotations
@@ -12,6 +14,7 @@ import argparse
 import math
 import sys
 import time
+import os
 from pathlib import Path
 from typing import Optional, Any
 import numpy as np
@@ -57,10 +60,13 @@ def render_vu_bar(db: float, width: int = 20) -> str:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Realtime AI Voice Changer (Male to Female)")
-    parser.add_argument("--input", type=int, default=None, help="Input audio device index (Microphone)")
-    parser.add_argument("--output", type=int, default=None, help="Output audio device index (Headphones or VB-Cable)")
-    parser.add_argument("--pitch", type=int, default=PITCH_SHIFT_SEMITONES, help="Pitch shift in semitones (default +12 for M2F)")
+    parser = argparse.ArgumentParser(description="SonicShift: Realtime AI Voice Changer (Male to Female)")
+    parser.add_argument("--input", type=int, default=None, help="Input device index (Microphone)")
+    parser.add_argument("--output", type=int, default=None, help="Output device index (CABLE Input / VB-Cable)")
+    parser.add_argument("--monitor", type=int, default=None, help="Monitor device index (Headphones to hear yourself)")
+    parser.add_argument("--no-monitor", action="store_true", help="Disable headphone monitoring")
+    parser.add_argument("--monitor-volume", type=float, default=1.0, help="Monitor volume [0.0 - 1.0]")
+    parser.add_argument("--pitch", type=int, default=PITCH_SHIFT_SEMITONES, help="Pitch shift in semitones (+12 for M2F)")
     parser.add_argument("--device", type=str, default=DEVICE, help="Inference hardware backend ('cuda' or 'cpu')")
     parser.add_argument("--model", type=str, default=None, help="Path to RVC .pth model checkpoint")
     parser.add_argument("--index", type=str, default=None, help="Path to FAISS .index file")
@@ -90,15 +96,34 @@ def main() -> None:
         print("Tip: Run 'python scripts/list_devices.py' to inspect your device indices.")
         sys.exit(1)
 
+    # Resolve Monitor device (Headphones)
+    mon_id: Optional[int] = None
+    if not args.no_monitor:
+        if args.monitor is not None:
+            mon_id = args.monitor
+        else:
+            mon_env_idx = os.getenv("MONITOR_DEVICE_INDEX")
+            mon_env_name = os.getenv("MONITOR_DEVICE_NAME", "Headphones")
+            try:
+                mon_id = resolve_device_id(
+                    name_query=mon_env_name,
+                    explicit_index=int(mon_env_idx) if mon_env_idx else None,
+                    is_input=False,
+                )
+            except Exception:
+                mon_id = None
+
     devices = sd.query_devices()
     in_name = devices[in_id]["name"]
     out_name = devices[out_id]["name"]
+    mon_name = devices[mon_id]["name"] if mon_id is not None else "Disabled"
 
     print("=" * 80)
-    print("      REALTIME AI VOICE CHANGER (MALE TO FEMALE) - LIVE STREAMING")
+    print("      SONICSHIFT: REALTIME AI VOICE CHANGER (MALE TO FEMALE)")
     print("=" * 80)
     print(f" Input Device (Mic)   : [{in_id}] {in_name}")
     print(f" Output Device (Play) : [{out_id}] {out_name}")
+    print(f" Monitor (Hear Self)  : [{mon_id if mon_id is not None else 'OFF'}] {mon_name}")
     print(f" Sampling Rate        : {SAMPLE_RATE} Hz")
     print(f" Block Size (Chunk)   : {BLOCK_SIZE} frames (~{(BLOCK_SIZE / SAMPLE_RATE) * 1000:.2f} ms)")
     print(f" Pitch Transposition  : {args.pitch:+d} semitones (Male -> Female)")
@@ -117,10 +142,9 @@ def main() -> None:
     # 3. Audio transformation callback
     def voice_processor(chunk: np.ndarray) -> np.ndarray:
         latest_rms["db"] = compute_rms_db(chunk)
-        # Apply AI / pitch transformation
         return converter.infer(chunk, f0_up_key=args.pitch)
 
-    # 4. Initialize Stream Manager
+    # 4. Initialize Stream Manager with Dual-Output Monitoring
     print("[STREAM] Starting low-latency RingBuffer audio pipeline...")
     stream_manager = AudioStreamManager(
         sample_rate=SAMPLE_RATE,
@@ -128,6 +152,8 @@ def main() -> None:
         channels=CHANNELS,
         input_device=in_id,
         output_device=out_id,
+        monitor_device=mon_id,
+        monitor_volume=args.monitor_volume,
         latency_preset=LATENCY_PRESET,
         buffer_blocks=QUEUE_MAX_BLOCKS,
         process_callback=voice_processor,
@@ -136,7 +162,9 @@ def main() -> None:
     try:
         stream_manager.start()
         print("\n" + "=" * 80)
-        print(" [LIVE] STREAMING ACTIVE! Speak into your microphone to hear transformed voice.")
+        print(" [LIVE] STREAMING ACTIVE! Speak into your microphone.")
+        if mon_id is not None:
+            print(f" [MONITOR] Transformed voice is streaming to your headphones ({mon_name}).")
         print(" Press Ctrl+C in terminal to stop.")
         print("=" * 80 + "\n")
 
@@ -151,7 +179,7 @@ def main() -> None:
             drops = m.input_overflows + m.output_underflows
 
             sys.stdout.write(
-                f"\r[MIC] {vu_str} | Proc: {proc_lat:4.1f}ms | "
+                f"\r[MIC] {vu_str} | GPU: {proc_lat:4.1f}ms | "
                 f"Buff In:{m.input_buffer_fill_pct:3.0f}% Out:{m.output_buffer_fill_pct:3.0f}% | "
                 f"Drops: {drops} | Time: {elapsed:5.1f}s  "
             )
