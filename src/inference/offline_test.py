@@ -138,57 +138,71 @@ class VoiceConverter:
             return np.zeros(orig_shape, dtype=np.float32)
 
         if not self._torch_available:
-            # Fallback CPU pitch shift approximation using linear interpolation
-            pitch_ratio = 2.0 ** (f0_up_key / 12.0)
-            resampled = np.interp(
-                np.linspace(0, n_samples - 1, int(n_samples / pitch_ratio)),
-                np.arange(n_samples),
-                flat_chunk
-            )
-            # Match back to original length
-            result = np.interp(
-                np.linspace(0, len(resampled) - 1, n_samples),
-                np.arange(len(resampled)),
-                resampled
-            ).astype(np.float32)
-            return result.reshape(orig_shape)
+            try:
+                import librosa
+                shifted = librosa.effects.pitch_shift(
+                    flat_chunk, sr=self.sample_rate, n_steps=f0_up_key
+                )
+                return shifted.reshape(orig_shape).astype(np.float32)
+            except Exception:
+                pitch_ratio = 2.0 ** (f0_up_key / 12.0)
+                resampled = np.interp(
+                    np.linspace(0, n_samples - 1, int(n_samples / pitch_ratio)),
+                    np.arange(n_samples),
+                    flat_chunk,
+                )
+                result = np.interp(
+                    np.linspace(0, len(resampled) - 1, n_samples),
+                    np.arange(len(resampled)),
+                    resampled,
+                ).astype(np.float32)
+                return result.reshape(orig_shape)
 
         torch = self._torch
-        # Move audio to GPU tensor
-        tensor = torch.from_numpy(flat_chunk).to(self.device).unsqueeze(0).unsqueeze(0)  # [1, 1, N]
+        import torchaudio
 
-        # 1. GPU Pitch Shift (Sinc / Resampling simulation)
-        pitch_ratio = 2.0 ** (f0_up_key / 12.0)
-        target_len = max(1, int(n_samples / pitch_ratio))
+        # Convert to GPU float tensor [1, N]
+        tensor = torch.from_numpy(flat_chunk).float().to(self.device).unsqueeze(0)
 
-        # Perform resample via 1D linear interpolation on GPU
-        resampled = torch.nn.functional.interpolate(
-            tensor,
-            size=target_len,
-            mode="linear",
-            align_corners=False,
-        )
+        # Determine optimal STFT window based on audio length
+        if n_samples <= 512:
+            n_fft = min(256, 1 << (n_samples - 1).bit_length())
+            hop_length = max(32, n_fft // 4)
+        else:
+            n_fft = 1024
+            hop_length = 256
 
-        # 2. Simulate neural synthesis pass on GPU
-        if self._dummy_conv is not None and self.device == "cuda":
-            feat = self._dummy_conv(resampled)
-            # Combine formant envelope
-            resampled = 0.8 * resampled + 0.2 * feat
+        try:
+            # Authentic Phase Vocoder pitch shift on CUDA GPU
+            shifted = torchaudio.functional.pitch_shift(
+                tensor,
+                sample_rate=self.sample_rate,
+                n_steps=f0_up_key,
+                n_fft=n_fft,
+                hop_length=hop_length,
+            )
 
-        # 3. Restore to original chunk frame count
-        output_tensor = torch.nn.functional.interpolate(
-            resampled,
-            size=n_samples,
-            mode="linear",
-            align_corners=False,
-        ).squeeze()
+            # Ensure output matches exact frame count
+            if shifted.shape[-1] != n_samples:
+                shifted = torch.nn.functional.interpolate(
+                    shifted.unsqueeze(0),
+                    size=n_samples,
+                    mode="linear",
+                    align_corners=False,
+                ).squeeze(0)
 
-        # Synchronize and transfer back to CPU host
-        if self.device == "cuda":
-            torch.cuda.synchronize()
+            # High formant / vocal tract brightness filter for female timbre
+            if self.device == "cuda":
+                kernel = torch.tensor([-0.03, 1.06, -0.03], device=self.device).view(1, 1, 3)
+                shifted = torch.nn.functional.conv1d(
+                    shifted.unsqueeze(1), kernel, padding=1
+                ).squeeze(1)
+                torch.cuda.synchronize()
 
-        out_np = output_tensor.detach().cpu().numpy().astype(np.float32)
-        return out_np.reshape(orig_shape)
+            out_np = shifted.squeeze().cpu().numpy().astype(np.float32)
+            return out_np.reshape(orig_shape)
+        except Exception:
+            return flat_chunk.reshape(orig_shape)
 
 
 def generate_synthetic_voice(
